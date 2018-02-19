@@ -1,9 +1,11 @@
+import datetime
 import json
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import paho.mqtt.client as mqtt_driver
 import pm
-from django.db.models.functions import datetime
+import time
 
 
 class UtilsHandler:
@@ -11,6 +13,16 @@ class UtilsHandler:
     def current_timestamp():
         # datetime.datetime.
         return str(datetime.datetime.now())
+    @staticmethod
+    def str_from_timestamp(timestamp):
+        return datetime.datetime.fromtimestamp(timestamp).strftime("%d/%m/%Y %H:%M:%S")
+
+    @staticmethod
+    def timestamp_from_str(str):
+        return time.mktime(datetime.datetime.strptime(str,
+                                                      "%d/%m/%Y %H:%M:%S").timetuple())
+
+
 
 
 class ConfigHandler:
@@ -121,13 +133,82 @@ class MongoHandler:
             LogHandler.log_error("[Mongo](Could not connect to database) " + str(e))
             exit()
 
+    def select(self, collection_name, query, columns):
+        result = None
+        if columns is not None:
+            result = self.db[collection_name].find(query, columns)
+        else:
+            result = self.db[collection_name].find(query)
+        return result
 
-class Row:
-    data = None
+
+class SQLiteHandler:
+    pass
+
+
+class MQTTHandler:
+    mqtt_host = mqtt_client = None
+    publish_info = None
 
     def __init__(self):
-        self.data = {}
+        self.mqtt_client = mqtt_driver.Client()
+        self.mqtt_host = ConfigHandler.get("mqtt_host")
+        self.connect()
+
+    def connect(self):
+        self.mqtt_client.connect(self.mqtt_host)
+        self.mqtt_client.on_disconnect = self.on_disconnect
+        self.mqtt_client.on_connect = self.on_connect
+
+    def on_disconnect(self):
+        LogHandler.log_info("[MQTT]Client disconnected.")
+
+    def on_connect(self):
+        LogHandler.log_info("[MQTT]Client connected.")
+
+    def publish(self, topic, payload):
+        self.publish_info = self.mqtt_client.publish(topic, payload, qos=0, retain=True)
+
+    def wait_for_publish(self):
+        if self.publish_info is not None:
+            self.publish_info.wait_for_publish()
+
+
+class Sensor:
+    sensor_id = channel = data = schema = None
+    ts_fetch_from = ts_fetch_till= None
+    mongo_query = None
+
+    def __init__(self, id,channel):
+        self.sensor_id = id
+        self.channel = channel
+        self.schema = ConfigHandler.get("channelwise_schema")[channel]
+        self.ts_fetch_from, self.ts_fetch_till  = self.get_fetch_timestamps()
+        self.mongo_query ={"$query": {"TS": {"$gt":self.ts_fetch_till, "$lte": self.ts_fetch_from}}, "$orderby": {"TS": -1}}
+
+    def send_data(self, mongo_db, mqtt_handler):
+        mongo_db.select(self.sensor_id,self.mongo_query,self.schema)
+        #update time till data is sent in sqlite
         pass
 
-    def __init__(self, data):
-        self.data = data
+    def get_fetch_timestamps(self):
+        ts_fetch_from = ""                      #TODO
+        records_batch_size_in_seconds = int(ConfigHandler.get("records_batch_size_in_seconds"))
+        ts_fetch_till = ts_fetch_from - records_batch_size_in_seconds
+        return ts_fetch_from, ts_fetch_till
+
+class Reader:
+    mongo_db = None
+    mqtt_handler = None
+    def __init__(self):
+        self.mongo_db = MongoHandler(ConfigHandler.get('mongo_host'), ConfigHandler.get('mongo_db_name'))
+        self.mqtt_handler = MQTTHandler()
+
+    def start_reading(self):
+        channels = ConfigHandler.get("channels")
+        channelwise_collections = ConfigHandler.get("channelwise_collections")
+        for channel in channels:
+            for collections in channelwise_collections[channel]:
+                for sensor_id in collections:
+                    sensor = Sensor(sensor_id,channel)
+                    sensor.send_data(self.mongo_db,self.mqtt_handler)
